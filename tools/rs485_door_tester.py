@@ -12,11 +12,11 @@ REG_COMMAND_RESULT = 3
 CMD_NONE = 0
 CMD_DOOR_OPEN = 1
 CMD_DOOR_CLOSE = 2
-CMD_DOOR_STOP = 3
 
 CMD_RESULT_TEXT = {
     0: "OK",
     1: "UNKNOWN_CMD",
+    2: "BUSY",
 }
 
 DIRECTION_TEXT = {
@@ -42,6 +42,8 @@ class App:
 
         self.status_var = tk.StringVar(value="Не подключено")
         self.values_var = tk.StringVar(value="-")
+        self.open_button = None
+        self.close_button = None
 
         self._build_ui()
         self._tick()
@@ -68,9 +70,10 @@ class App:
 
         door = ttk.LabelFrame(frm, text="Дверь", padding=8)
         door.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(door, text="Открыть", command=lambda: self.send_command(CMD_DOOR_OPEN)).grid(row=0, column=0, padx=4, pady=4)
-        ttk.Button(door, text="Закрыть", command=lambda: self.send_command(CMD_DOOR_CLOSE)).grid(row=0, column=1, padx=4, pady=4)
-        ttk.Button(door, text="Стоп", command=lambda: self.send_command(CMD_DOOR_STOP)).grid(row=0, column=2, padx=4, pady=4)
+        self.open_button = ttk.Button(door, text="Открыть", command=lambda: self.send_command(CMD_DOOR_OPEN))
+        self.open_button.grid(row=0, column=0, padx=4, pady=4)
+        self.close_button = ttk.Button(door, text="Закрыть", command=lambda: self.send_command(CMD_DOOR_CLOSE))
+        self.close_button.grid(row=0, column=1, padx=4, pady=4)
 
         stat = ttk.LabelFrame(frm, text="Статус", padding=8)
         stat.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -154,10 +157,44 @@ class App:
         direction_text = DIRECTION_TEXT.get(direction, f"UNKNOWN({direction})")
         cmd_res_text = CMD_RESULT_TEXT.get(cmd_res, f"UNKNOWN({cmd_res})")
         moving = "Да" if (status_bits & (1 << 0)) else "Нет"
+        is_open = bool(status_bits & (1 << 1))
+        is_closed = bool(status_bits & (1 << 2))
+        remote_enabled = bool(status_bits & (1 << 3))
+        manual_open = bool(status_bits & (1 << 4))
+        manual_close = bool(status_bits & (1 << 5))
+        invalid_mode = bool(status_bits & (1 << 6))
+        opened = "Да" if is_open else "Нет"
+        closed = "Да" if is_closed else "Нет"
+
+        if not remote_enabled or status_bits & (1 << 0):
+            self.open_button.state(["disabled"])
+            self.close_button.state(["disabled"])
+        elif is_open:
+            self.open_button.state(["disabled"])
+            self.close_button.state(["!disabled"])
+        elif is_closed:
+            self.open_button.state(["!disabled"])
+            self.close_button.state(["disabled"])
+        else:
+            self.open_button.state(["!disabled"])
+            self.close_button.state(["!disabled"])
+
+        if invalid_mode:
+            mode = "INVALID"
+        elif manual_open:
+            mode = "MANUAL_OPEN"
+        elif manual_close:
+            mode = "MANUAL_CLOSE"
+        elif remote_enabled:
+            mode = "AUTOMATIC"
+        else:
+            mode = "MANUAL_PENDING"
 
         lines = [
             f"Direction={direction} ({direction_text})",
-            f"Moving={moving}  StatusBits=0x{status_bits:04X}",
+            f"Moving={moving}  Open={opened}  Closed={closed}",
+            f"Mode={mode}  RemoteEnabled={'Да' if remote_enabled else 'Нет'}",
+            f"StatusBits=0x{status_bits:04X}",
             f"CommandResult={cmd_res} ({cmd_res_text})",
         ]
         self.values_var.set("\n".join(lines))
