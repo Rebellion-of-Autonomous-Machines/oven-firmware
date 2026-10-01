@@ -12,6 +12,7 @@ static const uint8_t PCF8574_RELAY_ADDR = 0x24;
 static const uint8_t PCF8574_INPUT_ADDR = 0x22;
 static const uint8_t DI5_BIT = 4; // P4 on input PCF8574
 static const uint8_t DI6_BIT = 5; // P5 on input PCF8574
+static const uint32_t INPUT_DEBOUNCE_MS = 80;
 
 // Physical relay indexes (0-based on PCF8574)
 static const uint8_t RELAY_MOTOR_A = 4; // Relay 5
@@ -86,11 +87,15 @@ DoorState doorState = DOOR_UNKNOWN;
 uint32_t doorMovementDeadlineMs = 0;
 bool di5State = true;
 bool di6State = false;
+bool rawDi5State = true;
+bool rawDi6State = false;
 bool inputStatesValid = false;
+uint32_t inputStateChangedMs = 0;
 ControlMode controlMode = MODE_INVALID;
 bool manualOverrideActive = false;
 bool manualCommandPending = false;
 MotorDirection manualTarget = MOTOR_STOP;
+bool selectorReadyForManualCommand = false;
 
 void initInputExpander() {
   // Writing ones keeps all PCF8574 pins in quasi-bidirectional input mode.
@@ -106,9 +111,30 @@ void updateInputStates() {
   }
 
   uint8_t inputByte = Wire.read();
-  di5State = bitRead(inputByte, DI5_BIT);
-  di6State = bitRead(inputByte, DI6_BIT);
-  inputStatesValid = true;
+  bool newDi5State = bitRead(inputByte, DI5_BIT);
+  bool newDi6State = bitRead(inputByte, DI6_BIT);
+
+  if (!inputStatesValid) {
+    rawDi5State = newDi5State;
+    rawDi6State = newDi6State;
+    di5State = newDi5State;
+    di6State = newDi6State;
+    inputStateChangedMs = millis();
+    inputStatesValid = true;
+    return;
+  }
+
+  if (newDi5State != rawDi5State || newDi6State != rawDi6State) {
+    rawDi5State = newDi5State;
+    rawDi6State = newDi6State;
+    inputStateChangedMs = millis();
+    return;
+  }
+
+  if ((millis() - inputStateChangedMs) >= INPUT_DEBOUNCE_MS) {
+    di5State = rawDi5State;
+    di6State = rawDi6State;
+  }
 }
 
 void writeRelays() {
@@ -137,6 +163,7 @@ void stopMotor() {
 }
 
 void startDoorMovement(MotorDirection target) {
+  selectorReadyForManualCommand = false;
   stopMotor();
   delay(RELAY_DEADTIME_MS);
 
@@ -175,12 +202,20 @@ ControlMode readControlMode() {
 }
 
 bool remoteCommandsAllowed() {
-  return controlMode == MODE_AUTOMATIC && !manualOverrideActive;
+  return controlMode == MODE_AUTOMATIC && !manualOverrideActive && !doorMoving();
 }
 
 const char* controlModeText() {
-  if (manualOverrideActive && controlMode == MODE_AUTOMATIC) {
-    return "Ручной: выполняется последняя команда";
+  if (doorMoving()) {
+    return "Движение: все команды заблокированы";
+  }
+  if (manualCommandPending) {
+    return manualTarget == MOTOR_OPEN
+        ? "Ручной: открыть, верните ключ в Автомат"
+        : "Ручной: закрыть, верните ключ в Автомат";
+  }
+  if (!selectorReadyForManualCommand && controlMode != MODE_AUTOMATIC) {
+    return "Верните ключ в Автомат";
   }
   switch (controlMode) {
     case MODE_AUTOMATIC: return "Автоматический";
@@ -210,33 +245,55 @@ void updateDoorState() {
     return;
   }
 
-  doorState = currentDirection == MOTOR_OPEN ? DOOR_OPEN : DOOR_CLOSED;
-  doorMovementDeadlineMs = 0;
+  DoorState completedState = currentDirection == MOTOR_OPEN ? DOOR_OPEN : DOOR_CLOSED;
+  stopMotor();
+  doorState = completedState;
 }
 
 void updateControlMode() {
   controlMode = readControlMode();
 
-  if (controlMode == MODE_MANUAL_OPEN || controlMode == MODE_MANUAL_CLOSE) {
-    manualOverrideActive = true;
-    manualCommandPending = true;
-    manualTarget = controlMode == MODE_MANUAL_OPEN ? MOTOR_OPEN : MOTOR_CLOSE;
+  // Selector changes during travel are observed only for indication.
+  // They never arm or queue a command.
+  if (doorMoving()) {
+    return;
   }
 
-  if (manualCommandPending && !doorMoving()) {
+  if (controlMode == MODE_MANUAL_OPEN || controlMode == MODE_MANUAL_CLOSE) {
+    manualOverrideActive = true;
+    // Until the selector returns to AUTO, the last stable manual position wins.
+    if (selectorReadyForManualCommand || manualCommandPending) {
+      manualCommandPending = true;
+      manualTarget = controlMode == MODE_MANUAL_OPEN ? MOTOR_OPEN : MOTOR_CLOSE;
+      selectorReadyForManualCommand = false;
+    }
+    return;
+  }
+
+  if (controlMode == MODE_AUTOMATIC && manualCommandPending) {
     bool targetReached =
         (manualTarget == MOTOR_OPEN && doorState == DOOR_OPEN) ||
         (manualTarget == MOTOR_CLOSE && doorState == DOOR_CLOSED);
+    manualCommandPending = false;
     if (targetReached) {
-      manualCommandPending = false;
+      manualOverrideActive = false;
+      manualTarget = MOTOR_STOP;
+      selectorReadyForManualCommand = true;
     } else {
       startDoorMovement(manualTarget);
     }
+    return;
   }
 
-  if (controlMode == MODE_AUTOMATIC && !doorMoving() && !manualCommandPending) {
+  if (controlMode == MODE_AUTOMATIC) {
     manualOverrideActive = false;
     manualTarget = MOTOR_STOP;
+    selectorReadyForManualCommand = true;
+  } else if (controlMode == MODE_INVALID) {
+    manualOverrideActive = true;
+    manualCommandPending = false;
+    manualTarget = MOTOR_STOP;
+    selectorReadyForManualCommand = false;
   }
 }
 
@@ -297,7 +354,7 @@ String generateHTML() {
 <body>
   <main class="panel">
     <h1>Управление дверью</h1>
-    <p class="sub">Противоположная команда становится доступна после завершения 6-секундного хода.</p>
+    <p class="sub">При включении дверь закрывается 6 секунд. Затем доступно только противоположное направление.</p>
     <div class="status">Состояние двери: <b id="direction">)rawliteral";
   html += String(doorStateText());
   html += R"rawliteral(</b></div>
@@ -351,6 +408,7 @@ void syncModbusRegistersFromState() {
   if (controlMode == MODE_MANUAL_OPEN) statusBits |= (1U << 4);
   if (controlMode == MODE_MANUAL_CLOSE) statusBits |= (1U << 5);
   if (controlMode == MODE_INVALID) statusBits |= (1U << 6);
+  if (manualCommandPending) statusBits |= (1U << 7);
   mb.Hreg(REG_STATUS_BITS, statusBits);
 }
 
@@ -417,6 +475,9 @@ void setup() {
   server.onNotFound(handleRedirectToRoot);
 
   server.begin();
+
+  // Establish a known safe position after every controller restart.
+  startDoorMovement(MOTOR_CLOSE);
 }
 
 void loop() {

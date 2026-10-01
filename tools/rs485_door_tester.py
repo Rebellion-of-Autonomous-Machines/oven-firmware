@@ -163,6 +163,7 @@ class App:
         manual_open = bool(status_bits & (1 << 4))
         manual_close = bool(status_bits & (1 << 5))
         invalid_mode = bool(status_bits & (1 << 6))
+        manual_armed = bool(status_bits & (1 << 7))
         opened = "Да" if is_open else "Нет"
         closed = "Да" if is_closed else "Нет"
 
@@ -179,7 +180,9 @@ class App:
             self.open_button.state(["!disabled"])
             self.close_button.state(["!disabled"])
 
-        if invalid_mode:
+        if manual_armed:
+            mode = "MANUAL_ARMED"
+        elif invalid_mode:
             mode = "INVALID"
         elif manual_open:
             mode = "MANUAL_OPEN"
