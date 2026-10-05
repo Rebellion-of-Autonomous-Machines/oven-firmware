@@ -13,6 +13,7 @@ static const uint8_t PCF8574_INPUT_ADDR = 0x22;
 static const uint8_t DI5_BIT = 4; // P4 on input PCF8574
 static const uint8_t DI6_BIT = 5; // P5 on input PCF8574
 static const uint32_t INPUT_DEBOUNCE_MS = 80;
+static const uint32_t MANUAL_POSITION_CONFIRM_MS = 350;
 
 // Physical relay indexes (0-based on PCF8574)
 static const uint8_t RELAY_MOTOR_A = 4; // Relay 5
@@ -96,6 +97,8 @@ bool manualOverrideActive = false;
 bool manualCommandPending = false;
 MotorDirection manualTarget = MOTOR_STOP;
 bool selectorReadyForManualCommand = false;
+ControlMode manualCandidateMode = MODE_INVALID;
+uint32_t manualCandidateStartedMs = 0;
 
 void initInputExpander() {
   // Writing ones keeps all PCF8574 pins in quasi-bidirectional input mode.
@@ -164,6 +167,8 @@ void stopMotor() {
 
 void startDoorMovement(MotorDirection target) {
   selectorReadyForManualCommand = false;
+  manualCandidateMode = MODE_INVALID;
+  manualCandidateStartedMs = 0;
   stopMotor();
   delay(RELAY_DEADTIME_MS);
 
@@ -214,6 +219,10 @@ const char* controlModeText() {
         ? "Ручной: открыть, верните ключ в Автомат"
         : "Ручной: закрыть, верните ключ в Автомат";
   }
+  if (selectorReadyForManualCommand &&
+      (controlMode == MODE_MANUAL_OPEN || controlMode == MODE_MANUAL_CLOSE)) {
+    return "Ожидание стабилизации ключа";
+  }
   if (!selectorReadyForManualCommand && controlMode != MODE_AUTOMATIC) {
     return "Верните ключ в Автомат";
   }
@@ -261,11 +270,30 @@ void updateControlMode() {
 
   if (controlMode == MODE_MANUAL_OPEN || controlMode == MODE_MANUAL_CLOSE) {
     manualOverrideActive = true;
-    // Until the selector returns to AUTO, the last stable manual position wins.
-    if (selectorReadyForManualCommand || manualCommandPending) {
+    // 0/1 is an unambiguous CLOSE position. It may replace a previously
+    // latched OPEN command, while transitional 1/1 can never replace CLOSE.
+    if (controlMode == MODE_MANUAL_CLOSE &&
+        (selectorReadyForManualCommand || manualCommandPending)) {
       manualCommandPending = true;
-      manualTarget = controlMode == MODE_MANUAL_OPEN ? MOTOR_OPEN : MOTOR_CLOSE;
+      manualTarget = MOTOR_CLOSE;
       selectorReadyForManualCommand = false;
+      manualCandidateMode = MODE_INVALID;
+      manualCandidateStartedMs = 0;
+    } else if (controlMode == MODE_MANUAL_OPEN &&
+               selectorReadyForManualCommand &&
+               !manualCommandPending) {
+      // 1/1 can occur while the selector travels toward CLOSE, therefore
+      // OPEN requires an additional confirmation interval.
+      if (manualCandidateMode != MODE_MANUAL_OPEN) {
+        manualCandidateMode = controlMode;
+        manualCandidateStartedMs = millis();
+      } else if ((millis() - manualCandidateStartedMs) >= MANUAL_POSITION_CONFIRM_MS) {
+        manualCommandPending = true;
+        manualTarget = MOTOR_OPEN;
+        selectorReadyForManualCommand = false;
+        manualCandidateMode = MODE_INVALID;
+        manualCandidateStartedMs = 0;
+      }
     }
     return;
   }
@@ -289,11 +317,16 @@ void updateControlMode() {
     manualOverrideActive = false;
     manualTarget = MOTOR_STOP;
     selectorReadyForManualCommand = true;
+    manualCandidateMode = MODE_INVALID;
+    manualCandidateStartedMs = 0;
   } else if (controlMode == MODE_INVALID) {
     manualOverrideActive = true;
-    manualCommandPending = false;
-    manualTarget = MOTOR_STOP;
-    selectorReadyForManualCommand = false;
+    if (!manualCommandPending) {
+      manualTarget = MOTOR_STOP;
+      selectorReadyForManualCommand = false;
+      manualCandidateMode = MODE_INVALID;
+      manualCandidateStartedMs = 0;
+    }
   }
 }
 
