@@ -4,6 +4,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ModbusRTU.h>
+#include <Preferences.h>
 
 // --- I2C relays ---
 static const uint8_t I2C_SDA_PIN = 4;
@@ -35,17 +36,34 @@ static const uint16_t DNS_PORT = 53;
 // --- Modbus RTU ---
 HardwareSerial RS485Serial(2);
 ModbusRTU mb;
+Preferences preferences;
 static const uint8_t RS485_RX_PIN = 14;
 static const uint8_t RS485_TX_PIN = 27;
 static const uint32_t RS485_BAUDRATE = 9600;
 static const uint8_t MODBUS_SLAVE_ID = 1;
 
-enum ModbusReg : uint16_t {
-  REG_COMMAND = 0,
-  REG_DIRECTION = 1,
-  REG_STATUS_BITS = 2,
-  REG_COMMAND_RESULT = 3,
+enum HoldingReg : uint16_t {
+  HREG_STAT_MODE = 0,       // 40001
+  HREG_STAT_ERROR = 1,      // 40002
+  HREG_MAN_CONTROL_C = 2,   // 40003
+  HREG_MAN_CONTROL_X = 3,   // 40004
+  HREG_MAN_CONTROL_Y = 4,   // 40005
+  HREG_MAN_CONTROL_Z = 5,   // 40006
+  HREG_COMMAND = 6,         // 40007, legacy high-level command
+  HREG_COMMAND_RESULT = 7,  // 40008
+  HREG_DIRECTION = 8,       // 40009
+  HREG_STATUS_BITS = 9,     // 40010
+  HREG_DI_BITS = 10,        // 40011
   REG_REG_COUNT = 16
+};
+
+enum InputReg : uint16_t {
+  IREG_TIME_ALL = 0,        // 30001
+  IREG_TIME_HEAT = 1,       // 30002
+  IREG_END_OPEN = 20,       // 30021
+  IREG_END_CLOSED = 21,     // 30022
+  IREG_RELAY_1 = 50,        // 30051 ... 30056
+  IREG_RELAY_COUNT = 6
 };
 
 enum ModbusCommand : uint16_t {
@@ -57,7 +75,37 @@ enum ModbusCommand : uint16_t {
 enum ModbusCommandResult : uint16_t {
   CMD_RES_OK = 0,
   CMD_RES_UNKNOWN_CMD = 1,
-  CMD_RES_BUSY = 2
+  CMD_RES_BUSY = 2,
+  CMD_RES_MODE_REQUIRED = 3,
+  CMD_RES_INVALID_ARG = 4,
+  CMD_RES_REMOTE_LOCKED = 5,
+  CMD_RES_UNSAFE_RELAY = 6
+};
+
+enum AutomationState : uint16_t {
+  STAT_INITIAL = 1,
+  STAT_SCENARIO_ACTIVE = 11,
+  STAT_SCENARIO_COMPLETE = 19,
+  STAT_MANUAL = 20,
+  STAT_EMERGENCY_STOP = 30,
+  STAT_ERROR = 99
+};
+
+enum AutomationError : uint16_t {
+  ERROR_NONE = 0,
+  ERROR_MANUAL_MODE_REQUIRED = 100,
+  ERROR_COMMAND_DURING_MOVEMENT = 101,
+  ERROR_INVALID_COMMAND = 102,
+  ERROR_REMOTE_CONTROL_LOCKED = 103,
+  ERROR_INVALID_RELAY = 104,
+  ERROR_UNSAFE_MOTOR_RELAY = 105
+};
+
+enum ManualControlCommand : uint16_t {
+  MAN_CMD_NONE = 0,
+  MAN_CMD_OPEN = 1,
+  MAN_CMD_CLOSE = 2,
+  MAN_CMD_SET_RELAY = 5
 };
 
 enum MotorDirection : uint8_t {
@@ -99,6 +147,44 @@ MotorDirection manualTarget = MOTOR_STOP;
 bool selectorReadyForManualCommand = false;
 ControlMode manualCandidateMode = MODE_INVALID;
 uint32_t manualCandidateStartedMs = 0;
+uint16_t automationState = STAT_INITIAL;
+uint16_t publishedAutomationState = STAT_INITIAL;
+uint16_t automationError = ERROR_NONE;
+uint16_t commandResult = CMD_RES_OK;
+uint64_t totalRuntimeSeconds = 0;
+uint64_t lastSavedRuntimeSeconds = 0;
+uint32_t runtimeTickMs = 0;
+
+static const uint32_t RUNTIME_SAVE_INTERVAL_SECONDS = 600;
+
+void loadRuntimeTelemetry() {
+  preferences.begin("telemetry", true);
+  totalRuntimeSeconds = preferences.getULong64("runtime_s", 0);
+  preferences.end();
+  lastSavedRuntimeSeconds = totalRuntimeSeconds;
+  runtimeTickMs = millis();
+}
+
+void saveRuntimeTelemetry() {
+  preferences.begin("telemetry", false);
+  preferences.putULong64("runtime_s", totalRuntimeSeconds);
+  preferences.end();
+  lastSavedRuntimeSeconds = totalRuntimeSeconds;
+}
+
+void updateRuntimeTelemetry() {
+  uint32_t now = millis();
+  uint32_t elapsedMs = now - runtimeTickMs;
+  if (elapsedMs >= 1000) {
+    uint32_t elapsedSeconds = elapsedMs / 1000;
+    totalRuntimeSeconds += elapsedSeconds;
+    runtimeTickMs += elapsedSeconds * 1000UL;
+  }
+
+  if ((totalRuntimeSeconds - lastSavedRuntimeSeconds) >= RUNTIME_SAVE_INTERVAL_SECONDS) {
+    saveRuntimeTelemetry();
+  }
+}
 
 void initInputExpander() {
   // Writing ones keeps all PCF8574 pins in quasi-bidirectional input mode.
@@ -184,6 +270,7 @@ void startDoorMovement(MotorDirection target) {
 
   currentDirection = target;
   doorMovementDeadlineMs = millis() + DOOR_TRAVEL_TIME_MS;
+  automationState = STAT_SCENARIO_ACTIVE;
 }
 
 bool doorMoving() {
@@ -198,6 +285,11 @@ bool canCloseDoor() {
   return doorState == DOOR_UNKNOWN || doorState == DOOR_OPEN;
 }
 
+bool doorAtTarget(MotorDirection target) {
+  return (target == MOTOR_OPEN && doorState == DOOR_OPEN) ||
+      (target == MOTOR_CLOSE && doorState == DOOR_CLOSED);
+}
+
 ControlMode readControlMode() {
   if (!inputStatesValid) return MODE_INVALID;
   if (di5State && !di6State) return MODE_AUTOMATIC;
@@ -207,7 +299,11 @@ ControlMode readControlMode() {
 }
 
 bool remoteCommandsAllowed() {
-  return controlMode == MODE_AUTOMATIC && !manualOverrideActive && !doorMoving();
+  return controlMode == MODE_AUTOMATIC &&
+      !manualOverrideActive &&
+      !doorMoving() &&
+      automationState != STAT_EMERGENCY_STOP &&
+      automationState != STAT_ERROR;
 }
 
 const char* controlModeText() {
@@ -257,6 +353,9 @@ void updateDoorState() {
   DoorState completedState = currentDirection == MOTOR_OPEN ? DOOR_OPEN : DOOR_CLOSED;
   stopMotor();
   doorState = completedState;
+  if (automationState != STAT_ERROR && automationState != STAT_EMERGENCY_STOP) {
+    automationState = STAT_SCENARIO_COMPLETE;
+  }
 }
 
 void updateControlMode() {
@@ -350,7 +449,10 @@ String statusJson() {
   json += "\"can_open\":" + String(remoteCommandsAllowed() && canOpenDoor() ? "true" : "false") + ",";
   json += "\"can_close\":" + String(remoteCommandsAllowed() && canCloseDoor() ? "true" : "false") + ",";
   json += "\"di5\":" + String(di5State ? 1 : 0) + ",";
-  json += "\"di6\":" + String(di6State ? 1 : 0);
+  json += "\"di6\":" + String(di6State ? 1 : 0) + ",";
+  json += "\"automation_state\":" + String(automationState) + ",";
+  json += "\"automation_error\":" + String(automationError) + ",";
+  json += "\"runtime_hours\":" + String(static_cast<uint32_t>(totalRuntimeSeconds / 3600ULL));
   json += "}";
   return json;
 }
@@ -431,8 +533,202 @@ String generateHTML() {
   return html;
 }
 
+void setAutomationError(uint16_t errorCode, uint16_t resultCode) {
+  automationError = errorCode;
+  automationState = STAT_ERROR;
+  commandResult = resultCode;
+}
+
+void clearManualControlRegisters() {
+  mb.Hreg(HREG_MAN_CONTROL_C, 0);
+  mb.Hreg(HREG_MAN_CONTROL_X, 0);
+  mb.Hreg(HREG_MAN_CONTROL_Y, 0);
+  mb.Hreg(HREG_MAN_CONTROL_Z, 0);
+}
+
+void handleAutomationStateWrite() {
+  uint16_t requestedState = mb.Hreg(HREG_STAT_MODE);
+  if (requestedState == publishedAutomationState) {
+    return;
+  }
+
+  if (requestedState == STAT_EMERGENCY_STOP) {
+    stopMotor();
+    doorState = DOOR_UNKNOWN;
+    automationState = STAT_EMERGENCY_STOP;
+    automationError = ERROR_NONE;
+    commandResult = CMD_RES_OK;
+    return;
+  }
+
+  if (requestedState == STAT_SCENARIO_ACTIVE) {
+    if (automationState != STAT_INITIAL) {
+      setAutomationError(ERROR_INVALID_COMMAND, CMD_RES_INVALID_ARG);
+      return;
+    }
+    if (!remoteCommandsAllowed()) {
+      setAutomationError(ERROR_REMOTE_CONTROL_LOCKED, CMD_RES_REMOTE_LOCKED);
+      return;
+    }
+    if (doorAtTarget(MOTOR_OPEN)) {
+      automationState = STAT_SCENARIO_COMPLETE;
+      automationError = ERROR_NONE;
+      commandResult = CMD_RES_OK;
+      return;
+    }
+    if (!requestDoorMovement(MOTOR_OPEN)) {
+      setAutomationError(ERROR_COMMAND_DURING_MOVEMENT, CMD_RES_BUSY);
+      return;
+    }
+    automationError = ERROR_NONE;
+    commandResult = CMD_RES_OK;
+    return;
+  }
+
+  if (requestedState < 1 || requestedState > 20) {
+    setAutomationError(ERROR_INVALID_COMMAND, CMD_RES_INVALID_ARG);
+    return;
+  }
+
+  if (doorMoving()) {
+    setAutomationError(ERROR_COMMAND_DURING_MOVEMENT, CMD_RES_BUSY);
+    return;
+  }
+
+  if (requestedState == STAT_MANUAL &&
+      (controlMode != MODE_AUTOMATIC || manualOverrideActive)) {
+    setAutomationError(ERROR_REMOTE_CONTROL_LOCKED, CMD_RES_REMOTE_LOCKED);
+    return;
+  }
+
+  automationError = ERROR_NONE;
+  automationState = requestedState;
+  commandResult = CMD_RES_OK;
+}
+
+void handleManualControlCommand() {
+  uint16_t command = mb.Hreg(HREG_MAN_CONTROL_C);
+  if (command == MAN_CMD_NONE) {
+    return;
+  }
+
+  uint16_t x = mb.Hreg(HREG_MAN_CONTROL_X);
+  uint16_t y = mb.Hreg(HREG_MAN_CONTROL_Y);
+  uint16_t z = mb.Hreg(HREG_MAN_CONTROL_Z);
+  clearManualControlRegisters();
+
+  // Preserve the more specific error raised while processing Stat_Mode
+  // from the same Write Multiple Registers transaction.
+  if (automationState == STAT_ERROR && commandResult != CMD_RES_OK) {
+    return;
+  }
+
+  if (automationState != STAT_MANUAL) {
+    setAutomationError(ERROR_MANUAL_MODE_REQUIRED, CMD_RES_MODE_REQUIRED);
+    return;
+  }
+  if (!remoteCommandsAllowed()) {
+    uint16_t errorCode = doorMoving() ? ERROR_COMMAND_DURING_MOVEMENT : ERROR_REMOTE_CONTROL_LOCKED;
+    uint16_t resultCode = doorMoving() ? CMD_RES_BUSY : CMD_RES_REMOTE_LOCKED;
+    setAutomationError(errorCode, resultCode);
+    return;
+  }
+
+  if (command == MAN_CMD_OPEN || command == MAN_CMD_CLOSE) {
+    if (x != 0 || y != 0 || z != 0) {
+      setAutomationError(ERROR_INVALID_COMMAND, CMD_RES_INVALID_ARG);
+      return;
+    }
+    MotorDirection target = command == MAN_CMD_OPEN ? MOTOR_OPEN : MOTOR_CLOSE;
+    if (doorAtTarget(target)) {
+      commandResult = CMD_RES_OK;
+      return;
+    }
+    if (!requestDoorMovement(target)) {
+      setAutomationError(ERROR_COMMAND_DURING_MOVEMENT, CMD_RES_BUSY);
+      return;
+    }
+    commandResult = CMD_RES_OK;
+    return;
+  }
+
+  if (command == MAN_CMD_SET_RELAY) {
+    if (x < 1 || x > 6 || y > 1 || z != 0) {
+      setAutomationError(ERROR_INVALID_RELAY, CMD_RES_INVALID_ARG);
+      return;
+    }
+
+    uint8_t relayIndex = static_cast<uint8_t>(x - 1);
+    if (relayIndex < RELAY_MOTOR_A) {
+      relayStates[relayIndex] = y != 0;
+      writeRelays();
+      commandResult = CMD_RES_OK;
+      return;
+    }
+
+    if (y == 0) {
+      if (relayStates[relayIndex]) {
+        setAutomationError(ERROR_UNSAFE_MOTOR_RELAY, CMD_RES_UNSAFE_RELAY);
+      } else {
+        commandResult = CMD_RES_OK;
+      }
+      return;
+    }
+
+    MotorDirection target = relayIndex == RELAY_MOTOR_A ? MOTOR_OPEN : MOTOR_CLOSE;
+    if (doorAtTarget(target)) {
+      commandResult = CMD_RES_OK;
+      return;
+    }
+    if (!requestDoorMovement(target)) {
+      setAutomationError(ERROR_UNSAFE_MOTOR_RELAY, CMD_RES_UNSAFE_RELAY);
+      return;
+    }
+    commandResult = CMD_RES_OK;
+    return;
+  }
+
+  setAutomationError(ERROR_INVALID_COMMAND, CMD_RES_UNKNOWN_CMD);
+}
+
+void handleLegacyModbusCommand() {
+  uint16_t cmd = mb.Hreg(HREG_COMMAND);
+  if (cmd == CMD_NONE) return;
+  mb.Hreg(HREG_COMMAND, CMD_NONE);
+
+  if (!remoteCommandsAllowed()) {
+    setAutomationError(
+        doorMoving() ? ERROR_COMMAND_DURING_MOVEMENT : ERROR_REMOTE_CONTROL_LOCKED,
+        doorMoving() ? CMD_RES_BUSY : CMD_RES_REMOTE_LOCKED);
+    return;
+  }
+
+  MotorDirection target;
+  if (cmd == CMD_DOOR_OPEN) {
+    target = MOTOR_OPEN;
+  } else if (cmd == CMD_DOOR_CLOSE) {
+    target = MOTOR_CLOSE;
+  } else {
+    setAutomationError(ERROR_INVALID_COMMAND, CMD_RES_UNKNOWN_CMD);
+    return;
+  }
+
+  if (doorAtTarget(target)) {
+    commandResult = CMD_RES_OK;
+    return;
+  }
+  if (!requestDoorMovement(target)) {
+    setAutomationError(ERROR_COMMAND_DURING_MOVEMENT, CMD_RES_BUSY);
+    return;
+  }
+  commandResult = CMD_RES_OK;
+}
+
 void syncModbusRegistersFromState() {
-  mb.Hreg(REG_DIRECTION, static_cast<uint16_t>(currentDirection));
+  mb.Hreg(HREG_STAT_MODE, automationState);
+  publishedAutomationState = automationState;
+  mb.Hreg(HREG_STAT_ERROR, automationError);
+  mb.Hreg(HREG_DIRECTION, static_cast<uint16_t>(currentDirection));
   uint16_t statusBits = 0;
   if (doorMoving()) statusBits |= (1U << 0);
   if (doorState == DOOR_OPEN) statusBits |= (1U << 1);
@@ -442,26 +738,26 @@ void syncModbusRegistersFromState() {
   if (controlMode == MODE_MANUAL_CLOSE) statusBits |= (1U << 5);
   if (controlMode == MODE_INVALID) statusBits |= (1U << 6);
   if (manualCommandPending) statusBits |= (1U << 7);
-  mb.Hreg(REG_STATUS_BITS, statusBits);
-}
+  mb.Hreg(HREG_STATUS_BITS, statusBits);
+  mb.Hreg(HREG_COMMAND_RESULT, commandResult);
 
-void handleModbusCommand() {
-  uint16_t cmd = mb.Hreg(REG_COMMAND);
-  if (cmd == CMD_NONE) return;
+  uint16_t diBits = 0;
+  if (di5State) diBits |= (1U << 0);
+  if (di6State) diBits |= (1U << 1);
+  if (inputStatesValid) diBits |= (1U << 2);
+  mb.Hreg(HREG_DI_BITS, diBits);
 
-  uint16_t result = CMD_RES_OK;
-  switch (cmd) {
-    case CMD_DOOR_OPEN:
-      if (!remoteCommandsAllowed() || !requestDoorMovement(MOTOR_OPEN)) result = CMD_RES_BUSY;
-      break;
-    case CMD_DOOR_CLOSE:
-      if (!remoteCommandsAllowed() || !requestDoorMovement(MOTOR_CLOSE)) result = CMD_RES_BUSY;
-      break;
-    default: result = CMD_RES_UNKNOWN_CMD; break;
+  uint64_t runtimeHours64 = totalRuntimeSeconds / 3600ULL;
+  uint16_t runtimeHours = runtimeHours64 > 65535ULL
+      ? 65535
+      : static_cast<uint16_t>(runtimeHours64);
+  mb.Ireg(IREG_TIME_ALL, runtimeHours);
+  mb.Ireg(IREG_TIME_HEAT, runtimeHours);
+  mb.Ireg(IREG_END_OPEN, doorState == DOOR_OPEN ? 1 : 0);
+  mb.Ireg(IREG_END_CLOSED, doorState == DOOR_CLOSED ? 1 : 0);
+  for (uint8_t i = 0; i < IREG_RELAY_COUNT; i++) {
+    mb.Ireg(IREG_RELAY_1 + i, relayStates[i] ? 1 : 0);
   }
-
-  mb.Hreg(REG_COMMAND_RESULT, result);
-  mb.Hreg(REG_COMMAND, CMD_NONE);
 }
 
 void handleRoot() { server.send(200, "text/html; charset=UTF-8", generateHTML()); }
@@ -482,6 +778,7 @@ void handleRedirectToRoot() {
 
 void setup() {
   Serial.begin(115200);
+  loadRuntimeTelemetry();
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   initInputExpander();
   updateInputStates();
@@ -490,8 +787,12 @@ void setup() {
   RS485Serial.begin(RS485_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
   mb.begin(&RS485Serial);
   mb.slave(MODBUS_SLAVE_ID);
-  mb.addHreg(REG_COMMAND, 0, REG_REG_COUNT);
-  mb.Hreg(REG_COMMAND_RESULT, CMD_RES_OK);
+  mb.addHreg(HREG_STAT_MODE, 0, REG_REG_COUNT);
+  mb.addIreg(IREG_TIME_ALL, 0, 2);
+  mb.addIreg(IREG_END_OPEN, 0, 2);
+  mb.addIreg(IREG_RELAY_1, 0, IREG_RELAY_COUNT);
+  mb.Hreg(HREG_COMMAND_RESULT, CMD_RES_OK);
+  clearManualControlRegisters();
   syncModbusRegistersFromState();
 
   WiFi.softAP(ap_ssid, ap_password);
@@ -511,15 +812,19 @@ void setup() {
 
   // Establish a known safe position after every controller restart.
   startDoorMovement(MOTOR_CLOSE);
+  syncModbusRegistersFromState();
 }
 
 void loop() {
   dnsServer.processNextRequest();
   updateInputStates();
+  updateRuntimeTelemetry();
   updateDoorState();
   updateControlMode();
   mb.task();
-  handleModbusCommand();
+  handleAutomationStateWrite();
+  handleManualControlCommand();
+  handleLegacyModbusCommand();
   syncModbusRegistersFromState();
   server.handleClient();
 }
