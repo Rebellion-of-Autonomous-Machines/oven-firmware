@@ -2,7 +2,7 @@ import inspect
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from pymodbus.client import ModbusSerialClient
+from pymodbus.client import ModbusTcpClient
 
 HREG_STAT_MODE = 0
 HREG_STAT_ERROR = 1
@@ -20,14 +20,12 @@ IREG_TIME_ALL = 0
 IREG_TIME_HEAT = 1
 IREG_END_OPEN = 20
 IREG_END_CLOSED = 21
-IREG_RELAY_1 = 50
 
 STAT_MANUAL = 20
 STAT_EMERGENCY_STOP = 30
 
 MAN_CMD_OPEN = 1
 MAN_CMD_CLOSE = 2
-MAN_CMD_SET_RELAY = 5
 
 STATE_TEXT = {
     1: "INITIAL",
@@ -44,8 +42,7 @@ ERROR_TEXT = {
     101: "COMMAND_DURING_MOVEMENT",
     102: "INVALID_COMMAND",
     103: "REMOTE_CONTROL_LOCKED",
-    104: "INVALID_RELAY",
-    105: "UNSAFE_MOTOR_RELAY",
+    105: "DIRECT_RELAY_CONTROL_FORBIDDEN",
 }
 
 RESULT_TEXT = {
@@ -55,7 +52,7 @@ RESULT_TEXT = {
     3: "MODE_REQUIRED",
     4: "INVALID_ARG",
     5: "REMOTE_LOCKED",
-    6: "UNSAFE_RELAY",
+    6: "RELAY_CONTROL_FORBIDDEN",
 }
 
 DIRECTION_TEXT = {0: "Стоп", 1: "Открытие", 2: "Закрытие"}
@@ -64,17 +61,15 @@ DIRECTION_TEXT = {0: "Стоп", 1: "Открытие", 2: "Закрытие"}
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("RS-485 Modbus: дверь печи")
+        self.root.title("Modbus TCP: дверь печи")
         self.root.geometry("760x520")
         self.root.minsize(700, 480)
         self.client = None
         self.connected = False
 
-        self.port_var = tk.StringVar(value="COM4")
-        self.baud_var = tk.StringVar(value="9600")
+        self.host_var = tk.StringVar(value="192.168.1.52")
+        self.port_var = tk.StringVar(value="502")
         self.slave_var = tk.StringVar(value="1")
-        self.relay_var = tk.StringVar(value="1")
-        self.relay_value_var = tk.StringVar(value="1")
         self.status_var = tk.StringVar(value="Не подключено")
         self.values_var = tk.StringVar(value="-")
         self.control_widgets = []
@@ -91,10 +86,10 @@ class App:
 
         connection = ttk.LabelFrame(frame, text="Подключение", padding=8)
         connection.grid(row=0, column=0, sticky="ew")
-        ttk.Label(connection, text="COM:").grid(row=0, column=0)
-        ttk.Entry(connection, textvariable=self.port_var, width=12).grid(row=0, column=1)
-        ttk.Label(connection, text="Baud:").grid(row=0, column=2, padx=(8, 0))
-        ttk.Entry(connection, textvariable=self.baud_var, width=9).grid(row=0, column=3)
+        ttk.Label(connection, text="IP:").grid(row=0, column=0)
+        ttk.Entry(connection, textvariable=self.host_var, width=16).grid(row=0, column=1)
+        ttk.Label(connection, text="Порт:").grid(row=0, column=2, padx=(8, 0))
+        ttk.Entry(connection, textvariable=self.port_var, width=9).grid(row=0, column=3)
         ttk.Label(connection, text="Slave ID:").grid(row=0, column=4, padx=(8, 0))
         ttk.Entry(connection, textvariable=self.slave_var, width=6).grid(row=0, column=5)
         ttk.Button(connection, text="Подключить", command=self.connect).grid(row=0, column=6, padx=(8, 0))
@@ -107,26 +102,6 @@ class App:
         open_button.grid(row=0, column=0, padx=4, pady=4)
         close_button.grid(row=0, column=1, padx=4, pady=4)
         self.control_widgets.extend([open_button, close_button])
-
-        ttk.Label(controls, text="Реле:").grid(row=1, column=0, sticky="e", pady=(8, 0))
-        ttk.Combobox(
-            controls,
-            textvariable=self.relay_var,
-            values=[str(i) for i in range(1, 7)],
-            width=5,
-            state="readonly",
-        ).grid(row=1, column=1, sticky="w", pady=(8, 0))
-        ttk.Label(controls, text="Значение:").grid(row=1, column=2, sticky="e", padx=(10, 0), pady=(8, 0))
-        ttk.Combobox(
-            controls,
-            textvariable=self.relay_value_var,
-            values=["0", "1"],
-            width=5,
-            state="readonly",
-        ).grid(row=1, column=3, sticky="w", pady=(8, 0))
-        relay_button = ttk.Button(controls, text="SET_RELAY", command=self.set_relay)
-        relay_button.grid(row=1, column=4, padx=8, pady=(8, 0))
-        self.control_widgets.append(relay_button)
 
         service = ttk.LabelFrame(frame, text="Состояние автоматики", padding=8)
         service.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -155,14 +130,12 @@ class App:
     def connect(self):
         self.disconnect()
         try:
-            self.client = ModbusSerialClient(
-                port=self.port_var.get().strip(),
-                baudrate=int(self.baud_var.get()),
-                bytesize=8,
-                parity="N",
-                stopbits=1,
-                timeout=1,
-            )
+            host = self.host_var.get().strip()
+            port = int(self.port_var.get())
+            unit = self._slave()
+            if not host or not 1 <= port <= 65535 or not 0 <= unit <= 255:
+                raise ValueError("Проверьте IP, порт (1...65535) и Unit ID (0...255)")
+            self.client = ModbusTcpClient(host=host, port=port, timeout=1)
             self.connected = bool(self.client.connect())
             self.status_var.set("Подключено" if self.connected else "Ошибка подключения")
         except Exception as exc:
@@ -215,14 +188,6 @@ class App:
         except Exception as exc:
             messagebox.showerror("Modbus", str(exc))
 
-    def set_relay(self):
-        self.send_manual_command(
-            MAN_CMD_SET_RELAY,
-            int(self.relay_var.get()),
-            int(self.relay_value_var.get()),
-            0,
-        )
-
     def read_holding(self, address: int, count: int):
         fn = self.client.read_holding_registers
         kwargs = {"count": count} if "count" in inspect.signature(fn).parameters else {}
@@ -246,7 +211,6 @@ class App:
         holding = self.read_holding(0, 11)
         time_regs = self.read_input(0, 2)
         ends = self.read_input(20, 2)
-        relays = self.read_input(50, 6)
 
         state = holding[HREG_STAT_MODE]
         error = holding[HREG_STAT_ERROR]
@@ -267,7 +231,6 @@ class App:
             f"40010 StatusBits=0x{status_bits:04X}  40011 DI5={di_bits & 1} DI6={(di_bits >> 1) & 1}",
             f"30001 TimeAll={time_regs[0]} h  30002 TimeHeat={time_regs[1]} h",
             f"30021 EndOpen={ends[0]}  30022 EndClosed={ends[1]}",
-            "30051-30056 Relays=" + " ".join(str(value) for value in relays),
         ]
         self.values_var.set("\n".join(lines))
 

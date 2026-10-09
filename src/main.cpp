@@ -1,9 +1,10 @@
 ﻿#include <Arduino.h>
 #include <WiFi.h>
+#include <SPI.h>
+#include <Ethernet.h>
 #include <Wire.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <ModbusRTU.h>
 #include <Preferences.h>
 
 // --- I2C relays ---
@@ -33,14 +34,32 @@ WebServer server(80);
 DNSServer dnsServer;
 static const uint16_t DNS_PORT = 53;
 
-// --- Modbus RTU ---
-HardwareSerial RS485Serial(2);
-ModbusRTU mb;
+// --- Ethernet / Modbus TCP (W5500) ---
 Preferences preferences;
-static const uint8_t RS485_RX_PIN = 14;
-static const uint8_t RS485_TX_PIN = 27;
-static const uint32_t RS485_BAUDRATE = 9600;
-static const uint8_t MODBUS_SLAVE_ID = 1;
+static const uint8_t W5500_CS_PIN = 5;
+static const uint16_t MODBUS_TCP_PORT = 502;
+static const uint8_t MODBUS_UNIT_ID = 1;
+byte ethernetMac[] = {0x02, 0xA0, 0xC9, 0x00, 0x00, 0x63};
+IPAddress ethernetIp(192, 168, 1, 52);
+IPAddress ethernetDns(192, 168, 1, 1);
+IPAddress ethernetGateway(192, 168, 1, 1);
+IPAddress ethernetSubnet(255, 255, 255, 0);
+bool ethernetUseDhcp = false;
+
+class Esp32EthernetServer : public EthernetServer {
+ public:
+  explicit Esp32EthernetServer(uint16_t port) : EthernetServer(port) {}
+
+  void begin(uint16_t port = 0) override {
+    (void)port;
+    EthernetServer::begin();
+  }
+};
+
+Esp32EthernetServer modbusServer(MODBUS_TCP_PORT);
+EthernetClient modbusClient;
+String networkSettingsMessage;
+bool networkSettingsSaved = false;
 
 enum HoldingReg : uint16_t {
   HREG_STAT_MODE = 0,       // 40001
@@ -61,10 +80,12 @@ enum InputReg : uint16_t {
   IREG_TIME_ALL = 0,        // 30001
   IREG_TIME_HEAT = 1,       // 30002
   IREG_END_OPEN = 20,       // 30021
-  IREG_END_CLOSED = 21,     // 30022
-  IREG_RELAY_1 = 50,        // 30051 ... 30056
-  IREG_RELAY_COUNT = 6
+  IREG_END_CLOSED = 21      // 30022
 };
+
+static const uint16_t INPUT_REG_COUNT = IREG_END_CLOSED + 1;
+uint16_t holdingRegs[REG_REG_COUNT] = {0};
+uint16_t inputRegs[INPUT_REG_COUNT] = {0};
 
 enum ModbusCommand : uint16_t {
   CMD_NONE = 0,
@@ -79,7 +100,7 @@ enum ModbusCommandResult : uint16_t {
   CMD_RES_MODE_REQUIRED = 3,
   CMD_RES_INVALID_ARG = 4,
   CMD_RES_REMOTE_LOCKED = 5,
-  CMD_RES_UNSAFE_RELAY = 6
+  CMD_RES_RELAY_CONTROL_FORBIDDEN = 6
 };
 
 enum AutomationState : uint16_t {
@@ -97,15 +118,14 @@ enum AutomationError : uint16_t {
   ERROR_COMMAND_DURING_MOVEMENT = 101,
   ERROR_INVALID_COMMAND = 102,
   ERROR_REMOTE_CONTROL_LOCKED = 103,
-  ERROR_INVALID_RELAY = 104,
-  ERROR_UNSAFE_MOTOR_RELAY = 105
+  ERROR_DIRECT_RELAY_CONTROL_FORBIDDEN = 105
 };
 
 enum ManualControlCommand : uint16_t {
   MAN_CMD_NONE = 0,
   MAN_CMD_OPEN = 1,
   MAN_CMD_CLOSE = 2,
-  MAN_CMD_SET_RELAY = 5
+  MAN_CMD_FORBIDDEN_RELAY_CONTROL = 5
 };
 
 enum MotorDirection : uint8_t {
@@ -184,6 +204,64 @@ void updateRuntimeTelemetry() {
   if ((totalRuntimeSeconds - lastSavedRuntimeSeconds) >= RUNTIME_SAVE_INTERVAL_SECONDS) {
     saveRuntimeTelemetry();
   }
+}
+
+bool parseIPv4(const String& text, IPAddress& address) {
+  String value = text;
+  value.trim();
+  return address.fromString(value);
+}
+
+void loadNetworkSettings() {
+  Preferences networkPreferences;
+  if (!networkPreferences.begin("ethernet", true)) return;
+
+  IPAddress address;
+  if (parseIPv4(networkPreferences.getString("ip", ethernetIp.toString()), address)) ethernetIp = address;
+  if (parseIPv4(networkPreferences.getString("subnet", ethernetSubnet.toString()), address)) ethernetSubnet = address;
+  if (parseIPv4(networkPreferences.getString("gateway", ethernetGateway.toString()), address)) ethernetGateway = address;
+  if (parseIPv4(networkPreferences.getString("dns", ethernetDns.toString()), address)) ethernetDns = address;
+  ethernetUseDhcp = networkPreferences.getBool("dhcp", false);
+  networkPreferences.end();
+}
+
+bool saveNetworkSettings() {
+  Preferences networkPreferences;
+  if (!networkPreferences.begin("ethernet", false)) return false;
+
+  bool saved = networkPreferences.putString("ip", ethernetIp.toString()) > 0;
+  saved &= networkPreferences.putString("subnet", ethernetSubnet.toString()) > 0;
+  saved &= networkPreferences.putString("gateway", ethernetGateway.toString()) > 0;
+  saved &= networkPreferences.putString("dns", ethernetDns.toString()) > 0;
+  saved &= networkPreferences.putBool("dhcp", ethernetUseDhcp) > 0;
+  networkPreferences.end();
+  return saved;
+}
+
+void applyEthernetSettings() {
+  if (modbusClient) modbusClient.stop();
+  if (ethernetUseDhcp) {
+    Ethernet.begin(ethernetMac, 10000, 2000);
+  } else {
+    Ethernet.begin(ethernetMac, ethernetIp, ethernetDns, ethernetGateway, ethernetSubnet);
+  }
+  delay(200);
+  modbusServer.begin();
+}
+
+const char* ethernetConnectionText() {
+  if (Ethernet.hardwareStatus() == EthernetNoHardware) return "W5500 не обнаружен";
+  if (Ethernet.linkStatus() == LinkOFF) return "Сетевой кабель отключен";
+  if (Ethernet.linkStatus() == Unknown) return "Состояние линии неизвестно";
+  if (Ethernet.localIP() == IPAddress(0, 0, 0, 0)) {
+    return ethernetUseDhcp ? "Адрес DHCP не получен" : "IP не назначен";
+  }
+  return "Подключено";
+}
+
+String modbusClientText() {
+  if (!modbusClient || !modbusClient.connected()) return "Нет подключения";
+  return modbusClient.remoteIP().toString() + ":" + String(modbusClient.remotePort());
 }
 
 void initInputExpander() {
@@ -476,7 +554,7 @@ String generateHTML() {
     }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: "Segoe UI", Tahoma, sans-serif; color: var(--text); background: linear-gradient(165deg, #e2e8f0 0%, var(--bg) 50%, #dbeafe 100%); padding: 16px; }
-    .panel { width: min(440px, 100%); background: var(--card); border-radius: 14px; box-shadow: 0 14px 28px rgba(15, 23, 42, .14); padding: 20px; }
+    .panel { width: min(560px, 100%); background: var(--card); border-radius: 14px; box-shadow: 0 14px 28px rgba(15, 23, 42, .14); padding: 20px; }
     h1 { margin: 0 0 8px; font-size: 24px; }
     .sub { margin: 0 0 16px; color: var(--muted); font-size: 14px; }
     .status { margin-bottom: 12px; border: 1px solid #cbd5e1; border-radius: 10px; padding: 10px 12px; background: #f8fafc; font-size: 15px; }
@@ -484,6 +562,18 @@ String generateHTML() {
     button { width: 100%; height: 54px; border: 0; border-radius: 10px; color: #fff; font-size: 18px; font-weight: 700; cursor: pointer; }
     .open { background: var(--open); }
     .close { background: var(--close); }
+    button:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
+    .network { margin-top: 18px; padding-top: 16px; border-top: 1px solid #cbd5e1; }
+    .network h2 { margin: 0 0 10px; font-size: 19px; }
+    .network-state { margin: 5px 0; color: var(--muted); font-size: 14px; }
+    .network-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+    .field { display: grid; gap: 5px; color: var(--muted); font-size: 13px; }
+    .field input, .field select { width: 100%; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; font-size: 15px; background: #fff; }
+    .network-form button { grid-column: 1 / -1; height: 46px; background: #0f766e; font-size: 16px; }
+    .notice { margin: 10px 0; padding: 10px; border-radius: 8px; font-size: 14px; }
+    .notice-ok { background: #e7f7ef; color: #08734d; }
+    .notice-error { background: #fdecea; color: var(--close); }
+    @media (max-width: 520px) { .network-form { grid-template-columns: 1fr; } .network-form button { grid-column: 1; } }
   </style>
 </head>
 <body>
@@ -509,8 +599,57 @@ String generateHTML() {
   if (!remoteCommandsAllowed() || !canCloseDoor()) html += "disabled";
   html += R"rawliteral(>Закрыть</button></form>
     </div>
+    <section class="network">
+      <h2>Ethernet / Modbus TCP</h2>
+)rawliteral";
+  if (networkSettingsMessage.length() > 0) {
+    html += "<div class=\"notice ";
+    html += networkSettingsSaved ? "notice-ok" : "notice-error";
+    html += "\">" + networkSettingsMessage + "</div>";
+  }
+  html += R"rawliteral(
+      <div class="network-state">Состояние W5500: <b>)rawliteral";
+  html += ethernetConnectionText();
+  html += R"rawliteral(</b></div>
+      <div class="network-state">Текущий IP: <b>)rawliteral";
+  html += Ethernet.localIP().toString();
+  html += R"rawliteral(</b></div>
+      <div class="network-state">Порт Modbus TCP: <b>502</b>, Unit ID: <b>1</b></div>
+      <div class="network-state">Клиент: <b>)rawliteral";
+  html += modbusClientText();
+  html += R"rawliteral(</b></div>
+      <form id="network-form" class="network-form" action="/network" method="post">
+        <label class="field">Получение адреса
+          <select id="network-mode" name="mode" onchange="updateNetworkMode()">
+            <option value="static")rawliteral";
+  if (!ethernetUseDhcp) html += " selected";
+  html += R"rawliteral(>Статический IP</option>
+            <option value="dhcp")rawliteral";
+  if (ethernetUseDhcp) html += " selected";
+  html += R"rawliteral(>DHCP</option>
+          </select>
+        </label>
+        <label class="field">IP-адрес<input class="static-network-field" name="ip" value=")rawliteral";
+  html += ethernetIp.toString();
+  html += R"rawliteral("></label>
+        <label class="field">Маска подсети<input class="static-network-field" name="subnet" value=")rawliteral";
+  html += ethernetSubnet.toString();
+  html += R"rawliteral("></label>
+        <label class="field">Шлюз<input class="static-network-field" name="gateway" value=")rawliteral";
+  html += ethernetGateway.toString();
+  html += R"rawliteral("></label>
+        <label class="field">DNS<input class="static-network-field" name="dns" value=")rawliteral";
+  html += ethernetDns.toString();
+  html += R"rawliteral("></label>
+        <button type="submit">Сохранить и применить</button>
+      </form>
+    </section>
   </main>
   <script>
+    function updateNetworkMode() {
+      const disabled = document.getElementById('network-mode').value === 'dhcp';
+      document.querySelectorAll('.static-network-field').forEach(function(field) { field.disabled = disabled; });
+    }
     async function refreshStatus() {
       try {
         const response = await fetch('/api/status', { cache: 'no-store' });
@@ -525,6 +664,7 @@ String generateHTML() {
       } catch (e) {}
     }
     setInterval(refreshStatus, 500);
+    updateNetworkMode();
     refreshStatus();
   </script>
 </body>
@@ -540,14 +680,14 @@ void setAutomationError(uint16_t errorCode, uint16_t resultCode) {
 }
 
 void clearManualControlRegisters() {
-  mb.Hreg(HREG_MAN_CONTROL_C, 0);
-  mb.Hreg(HREG_MAN_CONTROL_X, 0);
-  mb.Hreg(HREG_MAN_CONTROL_Y, 0);
-  mb.Hreg(HREG_MAN_CONTROL_Z, 0);
+  holdingRegs[HREG_MAN_CONTROL_C] = 0;
+  holdingRegs[HREG_MAN_CONTROL_X] = 0;
+  holdingRegs[HREG_MAN_CONTROL_Y] = 0;
+  holdingRegs[HREG_MAN_CONTROL_Z] = 0;
 }
 
 void handleAutomationStateWrite() {
-  uint16_t requestedState = mb.Hreg(HREG_STAT_MODE);
+  uint16_t requestedState = holdingRegs[HREG_STAT_MODE];
   if (requestedState == publishedAutomationState) {
     return;
   }
@@ -607,15 +747,20 @@ void handleAutomationStateWrite() {
 }
 
 void handleManualControlCommand() {
-  uint16_t command = mb.Hreg(HREG_MAN_CONTROL_C);
+  uint16_t command = holdingRegs[HREG_MAN_CONTROL_C];
   if (command == MAN_CMD_NONE) {
     return;
   }
 
-  uint16_t x = mb.Hreg(HREG_MAN_CONTROL_X);
-  uint16_t y = mb.Hreg(HREG_MAN_CONTROL_Y);
-  uint16_t z = mb.Hreg(HREG_MAN_CONTROL_Z);
+  uint16_t x = holdingRegs[HREG_MAN_CONTROL_X];
+  uint16_t y = holdingRegs[HREG_MAN_CONTROL_Y];
+  uint16_t z = holdingRegs[HREG_MAN_CONTROL_Z];
   clearManualControlRegisters();
+
+  if (command == MAN_CMD_FORBIDDEN_RELAY_CONTROL) {
+    setAutomationError(ERROR_DIRECT_RELAY_CONTROL_FORBIDDEN, CMD_RES_RELAY_CONTROL_FORBIDDEN);
+    return;
+  }
 
   // Preserve the more specific error raised while processing Stat_Mode
   // from the same Write Multiple Registers transaction.
@@ -652,49 +797,13 @@ void handleManualControlCommand() {
     return;
   }
 
-  if (command == MAN_CMD_SET_RELAY) {
-    if (x < 1 || x > 6 || y > 1 || z != 0) {
-      setAutomationError(ERROR_INVALID_RELAY, CMD_RES_INVALID_ARG);
-      return;
-    }
-
-    uint8_t relayIndex = static_cast<uint8_t>(x - 1);
-    if (relayIndex < RELAY_MOTOR_A) {
-      relayStates[relayIndex] = y != 0;
-      writeRelays();
-      commandResult = CMD_RES_OK;
-      return;
-    }
-
-    if (y == 0) {
-      if (relayStates[relayIndex]) {
-        setAutomationError(ERROR_UNSAFE_MOTOR_RELAY, CMD_RES_UNSAFE_RELAY);
-      } else {
-        commandResult = CMD_RES_OK;
-      }
-      return;
-    }
-
-    MotorDirection target = relayIndex == RELAY_MOTOR_A ? MOTOR_OPEN : MOTOR_CLOSE;
-    if (doorAtTarget(target)) {
-      commandResult = CMD_RES_OK;
-      return;
-    }
-    if (!requestDoorMovement(target)) {
-      setAutomationError(ERROR_UNSAFE_MOTOR_RELAY, CMD_RES_UNSAFE_RELAY);
-      return;
-    }
-    commandResult = CMD_RES_OK;
-    return;
-  }
-
   setAutomationError(ERROR_INVALID_COMMAND, CMD_RES_UNKNOWN_CMD);
 }
 
 void handleLegacyModbusCommand() {
-  uint16_t cmd = mb.Hreg(HREG_COMMAND);
+  uint16_t cmd = holdingRegs[HREG_COMMAND];
   if (cmd == CMD_NONE) return;
-  mb.Hreg(HREG_COMMAND, CMD_NONE);
+  holdingRegs[HREG_COMMAND] = CMD_NONE;
 
   if (!remoteCommandsAllowed()) {
     setAutomationError(
@@ -725,10 +834,10 @@ void handleLegacyModbusCommand() {
 }
 
 void syncModbusRegistersFromState() {
-  mb.Hreg(HREG_STAT_MODE, automationState);
+  holdingRegs[HREG_STAT_MODE] = automationState;
   publishedAutomationState = automationState;
-  mb.Hreg(HREG_STAT_ERROR, automationError);
-  mb.Hreg(HREG_DIRECTION, static_cast<uint16_t>(currentDirection));
+  holdingRegs[HREG_STAT_ERROR] = automationError;
+  holdingRegs[HREG_DIRECTION] = static_cast<uint16_t>(currentDirection);
   uint16_t statusBits = 0;
   if (doorMoving()) statusBits |= (1U << 0);
   if (doorState == DOOR_OPEN) statusBits |= (1U << 1);
@@ -738,25 +847,170 @@ void syncModbusRegistersFromState() {
   if (controlMode == MODE_MANUAL_CLOSE) statusBits |= (1U << 5);
   if (controlMode == MODE_INVALID) statusBits |= (1U << 6);
   if (manualCommandPending) statusBits |= (1U << 7);
-  mb.Hreg(HREG_STATUS_BITS, statusBits);
-  mb.Hreg(HREG_COMMAND_RESULT, commandResult);
+  holdingRegs[HREG_STATUS_BITS] = statusBits;
+  holdingRegs[HREG_COMMAND_RESULT] = commandResult;
 
   uint16_t diBits = 0;
   if (di5State) diBits |= (1U << 0);
   if (di6State) diBits |= (1U << 1);
   if (inputStatesValid) diBits |= (1U << 2);
-  mb.Hreg(HREG_DI_BITS, diBits);
+  holdingRegs[HREG_DI_BITS] = diBits;
 
   uint64_t runtimeHours64 = totalRuntimeSeconds / 3600ULL;
   uint16_t runtimeHours = runtimeHours64 > 65535ULL
       ? 65535
       : static_cast<uint16_t>(runtimeHours64);
-  mb.Ireg(IREG_TIME_ALL, runtimeHours);
-  mb.Ireg(IREG_TIME_HEAT, runtimeHours);
-  mb.Ireg(IREG_END_OPEN, doorState == DOOR_OPEN ? 1 : 0);
-  mb.Ireg(IREG_END_CLOSED, doorState == DOOR_CLOSED ? 1 : 0);
-  for (uint8_t i = 0; i < IREG_RELAY_COUNT; i++) {
-    mb.Ireg(IREG_RELAY_1 + i, relayStates[i] ? 1 : 0);
+  inputRegs[IREG_TIME_ALL] = runtimeHours;
+  inputRegs[IREG_TIME_HEAT] = runtimeHours;
+  inputRegs[IREG_END_OPEN] = doorState == DOOR_OPEN ? 1 : 0;
+  inputRegs[IREG_END_CLOSED] = doorState == DOOR_CLOSED ? 1 : 0;
+}
+
+void sendModbusTcpResponse(EthernetClient& client, const uint8_t* requestHeader,
+                           const uint8_t* pdu, uint16_t pduLength) {
+  uint8_t header[7] = {
+      requestHeader[0], requestHeader[1], 0, 0,
+      highByte(pduLength + 1), lowByte(pduLength + 1), requestHeader[6]};
+  client.write(header, sizeof(header));
+  client.write(pdu, pduLength);
+}
+
+void sendModbusException(EthernetClient& client, const uint8_t* header,
+                         uint8_t functionCode, uint8_t exceptionCode) {
+  uint8_t pdu[2] = {static_cast<uint8_t>(functionCode | 0x80), exceptionCode};
+  sendModbusTcpResponse(client, header, pdu, sizeof(pdu));
+}
+
+bool waitForClientBytes(EthernetClient& client, int count, uint16_t timeoutMs = 50) {
+  uint32_t started = millis();
+  while (client.connected() && client.available() < count &&
+         millis() - started < timeoutMs) {
+    delay(1);
+  }
+  return client.available() >= count;
+}
+
+bool validInputRegisterRange(uint16_t startAddress, uint16_t quantity) {
+  if (quantity == 0) return false;
+  uint32_t endAddress = static_cast<uint32_t>(startAddress) + quantity - 1;
+  return (startAddress >= IREG_TIME_ALL && endAddress <= IREG_TIME_HEAT) ||
+      (startAddress >= IREG_END_OPEN && endAddress <= IREG_END_CLOSED);
+}
+
+bool writableHoldingRegister(uint16_t address) {
+  return address <= HREG_COMMAND;
+}
+
+void processModbusTcpRequest(EthernetClient& client) {
+  if (!waitForClientBytes(client, 7)) return;
+
+  uint8_t header[7];
+  client.read(header, sizeof(header));
+  uint16_t protocolId = word(header[2], header[3]);
+  uint16_t length = word(header[4], header[5]);
+  if (protocolId != 0 || length < 2 || length > 253) {
+    client.stop();
+    return;
+  }
+
+  uint16_t pduLength = length - 1;
+  if (!waitForClientBytes(client, pduLength)) {
+    client.stop();
+    return;
+  }
+
+  uint8_t pdu[253];
+  client.read(pdu, pduLength);
+  uint8_t functionCode = pdu[0];
+  if (header[6] != MODBUS_UNIT_ID && header[6] != 0) return;
+  syncModbusRegistersFromState();
+
+  if (functionCode == 0x03 || functionCode == 0x04) {
+    if (pduLength < 5) {
+      sendModbusException(client, header, functionCode, 0x03);
+      return;
+    }
+    uint16_t startAddress = word(pdu[1], pdu[2]);
+    uint16_t quantity = word(pdu[3], pdu[4]);
+    bool validRange = functionCode == 0x03
+        ? quantity > 0 && quantity <= 125 &&
+            static_cast<uint32_t>(startAddress) + quantity <= REG_REG_COUNT
+        : quantity <= 125 && validInputRegisterRange(startAddress, quantity);
+    if (!validRange) {
+      sendModbusException(client, header, functionCode, 0x02);
+      return;
+    }
+
+    uint8_t response[252];
+    response[0] = functionCode;
+    response[1] = quantity * 2;
+    for (uint16_t i = 0; i < quantity; i++) {
+      uint16_t value = functionCode == 0x03
+          ? holdingRegs[startAddress + i]
+          : inputRegs[startAddress + i];
+      response[2 + i * 2] = highByte(value);
+      response[3 + i * 2] = lowByte(value);
+    }
+    sendModbusTcpResponse(client, header, response, 2 + quantity * 2);
+    return;
+  }
+
+  if (functionCode == 0x06) {
+    if (pduLength < 5) {
+      sendModbusException(client, header, functionCode, 0x03);
+      return;
+    }
+    uint16_t address = word(pdu[1], pdu[2]);
+    if (!writableHoldingRegister(address)) {
+      sendModbusException(client, header, functionCode, 0x02);
+      return;
+    }
+    holdingRegs[address] = word(pdu[3], pdu[4]);
+    sendModbusTcpResponse(client, header, pdu, 5);
+    return;
+  }
+
+  if (functionCode == 0x10) {
+    if (pduLength < 6) {
+      sendModbusException(client, header, functionCode, 0x03);
+      return;
+    }
+    uint16_t startAddress = word(pdu[1], pdu[2]);
+    uint16_t quantity = word(pdu[3], pdu[4]);
+    uint8_t byteCount = pdu[5];
+    bool validRange = quantity > 0 && quantity <= 123 &&
+        byteCount == quantity * 2 && pduLength >= 6 + byteCount &&
+        static_cast<uint32_t>(startAddress) + quantity <= REG_REG_COUNT;
+    if (validRange) {
+      for (uint16_t i = 0; i < quantity; i++) {
+        if (!writableHoldingRegister(startAddress + i)) {
+          validRange = false;
+          break;
+        }
+      }
+    }
+    if (!validRange) {
+      sendModbusException(client, header, functionCode, 0x02);
+      return;
+    }
+    for (uint16_t i = 0; i < quantity; i++) {
+      holdingRegs[startAddress + i] = word(pdu[6 + i * 2], pdu[7 + i * 2]);
+    }
+    uint8_t response[5] = {functionCode, pdu[1], pdu[2], pdu[3], pdu[4]};
+    sendModbusTcpResponse(client, header, response, sizeof(response));
+    return;
+  }
+
+  sendModbusException(client, header, functionCode, 0x01);
+}
+
+void handleModbusTcp() {
+  if (!modbusClient || !modbusClient.connected()) {
+    EthernetClient newClient = modbusServer.available();
+    if (newClient) modbusClient = newClient;
+  }
+  if (modbusClient && modbusClient.connected() && modbusClient.available()) {
+    processModbusTcpRequest(modbusClient);
   }
 }
 
@@ -768,6 +1022,68 @@ void handleOpen() {
 }
 void handleClose() {
   if (remoteCommandsAllowed()) requestDoorMovement(MOTOR_CLOSE);
+  handleRoot();
+}
+
+void handleNetworkSettings() {
+  if (doorMoving()) {
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Настройки сети можно менять только после остановки двери.";
+    server.send(409, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+  if (!server.hasArg("mode") ||
+      (server.arg("mode") != "static" && server.arg("mode") != "dhcp")) {
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Выберите режим получения IP-адреса.";
+    server.send(400, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+
+  bool newUseDhcp = server.arg("mode") == "dhcp";
+  IPAddress newIp, newSubnet, newGateway, newDns;
+  if (!newUseDhcp &&
+      (!server.hasArg("ip") || !server.hasArg("subnet") ||
+       !server.hasArg("gateway") || !server.hasArg("dns") ||
+       !parseIPv4(server.arg("ip"), newIp) ||
+       !parseIPv4(server.arg("subnet"), newSubnet) ||
+       !parseIPv4(server.arg("gateway"), newGateway) ||
+       !parseIPv4(server.arg("dns"), newDns))) {
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Ошибка: проверьте формат IPv4-адресов.";
+    server.send(400, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+
+  bool oldDhcp = ethernetUseDhcp;
+  IPAddress oldIp = ethernetIp;
+  IPAddress oldSubnet = ethernetSubnet;
+  IPAddress oldGateway = ethernetGateway;
+  IPAddress oldDns = ethernetDns;
+  ethernetUseDhcp = newUseDhcp;
+  if (!newUseDhcp) {
+    ethernetIp = newIp;
+    ethernetSubnet = newSubnet;
+    ethernetGateway = newGateway;
+    ethernetDns = newDns;
+  }
+
+  if (!saveNetworkSettings()) {
+    ethernetUseDhcp = oldDhcp;
+    ethernetIp = oldIp;
+    ethernetSubnet = oldSubnet;
+    ethernetGateway = oldGateway;
+    ethernetDns = oldDns;
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Не удалось сохранить настройки сети.";
+    server.send(500, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+
+  applyEthernetSettings();
+  networkSettingsSaved = true;
+  networkSettingsMessage = "Настройки сохранены. Текущий IP W5500: " +
+      Ethernet.localIP().toString();
   handleRoot();
 }
 
@@ -784,16 +1100,14 @@ void setup() {
   updateInputStates();
   stopMotor();
 
-  RS485Serial.begin(RS485_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-  mb.begin(&RS485Serial);
-  mb.slave(MODBUS_SLAVE_ID);
-  mb.addHreg(HREG_STAT_MODE, 0, REG_REG_COUNT);
-  mb.addIreg(IREG_TIME_ALL, 0, 2);
-  mb.addIreg(IREG_END_OPEN, 0, 2);
-  mb.addIreg(IREG_RELAY_1, 0, IREG_RELAY_COUNT);
-  mb.Hreg(HREG_COMMAND_RESULT, CMD_RES_OK);
+  holdingRegs[HREG_COMMAND_RESULT] = CMD_RES_OK;
   clearManualControlRegisters();
   syncModbusRegistersFromState();
+
+  SPI.begin();
+  Ethernet.init(W5500_CS_PIN);
+  loadNetworkSettings();
+  applyEthernetSettings();
 
   WiFi.softAP(ap_ssid, ap_password);
   delay(200);
@@ -803,12 +1117,18 @@ void setup() {
   server.on("/open", HTTP_POST, handleOpen);
   server.on("/close", HTTP_POST, handleClose);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/network", HTTP_POST, handleNetworkSettings);
   server.on("/generate_204", HTTP_GET, handleRedirectToRoot);
   server.on("/hotspot-detect.html", HTTP_GET, handleRedirectToRoot);
   server.on("/fwlink", HTTP_GET, handleRedirectToRoot);
   server.onNotFound(handleRedirectToRoot);
 
   server.begin();
+
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("Ethernet IP: ");
+  Serial.println(Ethernet.localIP());
 
   // Establish a known safe position after every controller restart.
   startDoorMovement(MOTOR_CLOSE);
@@ -821,7 +1141,8 @@ void loop() {
   updateRuntimeTelemetry();
   updateDoorState();
   updateControlMode();
-  mb.task();
+  if (ethernetUseDhcp) Ethernet.maintain();
+  handleModbusTcp();
   handleAutomationStateWrite();
   handleManualControlCommand();
   handleLegacyModbusCommand();
